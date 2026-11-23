@@ -11,17 +11,21 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
 )
 
-const usage = `usage: git-cheat-leadtime [skip=fix] [base=BRANCH] [remote=NAME] [push] [newpr] [DIR]
+const usage = `usage: git-cheat-leadtime [skip=fix] [base=BRANCH] [remote=NAME] [push] [newpr] [branch=NAME] [DIR]
   skip=fix  don't ask claude to resolve conflicts; stop the rebase for manual fixing
   base      branch to rebase onto (default: the remote's HEAD, else main or master)
   remote    remote to fetch from (default: origin)
   push      force push (with lease) when done
-  newpr     push, then close the branch's open PR and open a new one in its
-            place (same title, body, base, labels, assignees, reviewers) with
-            a comment on the old PR linking to the new one; needs gh
+  newpr     move the commits to a new branch, push it and open a new PR in
+            place of the branch's open PR (same title, body, base, labels,
+            assignees, reviewers), then comment on and close the old PR and
+            delete the old branch; needs gh
+  branch    name of the new branch for newpr (default: BRANCH-YYYYMMDD)
   DIR       repo to update (default: .)
 options may also be written -opt=VALUE or --opt=VALUE
 
@@ -36,6 +40,7 @@ type options struct {
 	remote string
 	push   bool
 	newpr  bool
+	branch string // new branch name for newpr
 	dir    string
 }
 
@@ -83,6 +88,9 @@ func parseArgs(args []string) (*options, error) {
 			case "push":
 				opts.push = val != "false" && val != "0"
 				continue
+			case "branch":
+				opts.branch = val
+				continue
 			case "newpr":
 				opts.newpr = val != "false" && val != "0"
 				continue
@@ -109,8 +117,8 @@ func parseArgs(args []string) (*options, error) {
 		return nil, err
 	}
 	opts.dir = abs
-	if opts.newpr {
-		opts.push = true // the new PR needs the rewritten branch on the remote
+	if opts.branch != "" && !opts.newpr {
+		return nil, fmt.Errorf("branch=NAME only works with newpr")
 	}
 	return opts, nil
 }
@@ -141,6 +149,15 @@ func run(opts *options) error {
 		}
 		oldPR = pr
 		fmt.Printf("found PR #%d: %s\n", pr.Number, pr.Title)
+
+		if opts.branch == "" {
+			opts.branch = newBranchName(dir, opts.remote, branch)
+		} else if opts.branch == branch {
+			return fmt.Errorf("branch=%s is the current branch; pick a new name", branch)
+		} else if branchExists(dir, opts.remote, opts.branch) {
+			return fmt.Errorf("branch %s already exists", opts.branch)
+		}
+		fmt.Printf("new branch will be %s\n", opts.branch)
 	}
 
 	base := opts.base
@@ -192,16 +209,17 @@ func run(opts *options) error {
 		err = gitInteractive(dir, "rebase", "--continue")
 	}
 
-	if opts.push {
+	if opts.push && oldPR == nil {
 		fmt.Println("pushing")
 		if err := gitInteractive(dir, "push", "--force-with-lease", opts.remote, branch); err != nil {
 			return fmt.Errorf("push failed: %v", err)
 		}
 	}
 	if oldPR != nil {
-		if err := replacePR(dir, branch, oldPR); err != nil {
+		if err := replacePR(dir, opts.remote, branch, opts.branch, oldPR); err != nil {
 			return err
 		}
+		branch = opts.branch
 	}
 	fmt.Printf("done: %s is on %s with today's dates\n", branch, upstream)
 	return nil
@@ -341,6 +359,13 @@ type pullRequest struct {
 	ReviewRequests []struct {
 		Login string `json:"login"` // empty for team requests
 	} `json:"reviewRequests"`
+	// The repo the PR's branch lives in, which may be a fork.
+	HeadRepository struct {
+		Name string `json:"name"`
+	} `json:"headRepository"`
+	HeadRepositoryOwner struct {
+		Login string `json:"login"`
+	} `json:"headRepositoryOwner"`
 	LatestReviews []struct {
 		Author struct {
 			Login string `json:"login"`
@@ -354,7 +379,7 @@ func findPR(dir, branch string) (*pullRequest, error) {
 		return nil, fmt.Errorf("newpr needs the gh CLI: https://cli.github.com")
 	}
 	out, err := gh(dir, "pr", "view", branch, "--json",
-		"number,url,title,body,baseRefName,isDraft,state,author,labels,assignees,reviewRequests,latestReviews")
+		"number,url,title,body,baseRefName,isDraft,state,author,labels,assignees,reviewRequests,latestReviews,headRepository,headRepositoryOwner")
 	if err != nil {
 		return nil, fmt.Errorf("no PR found for %s: %v", branch, err)
 	}
@@ -371,15 +396,18 @@ func findPR(dir, branch string) (*pullRequest, error) {
 	return &pr.pullRequest, nil
 }
 
-// replacePR closes old and opens a new PR from branch with the same details,
-// then comments on old with a link to the new one. GitHub allows only one open
-// PR per branch and base, so old has to be closed first; if creating the new
-// one fails, old is reopened.
-func replacePR(dir, branch string, old *pullRequest) error {
-	num := fmt.Sprint(old.Number)
-	fmt.Printf("closing PR #%d\n", old.Number)
-	if _, err := gh(dir, "pr", "close", num); err != nil {
-		return fmt.Errorf("closing PR #%d failed: %v", old.Number, err)
+// replacePR moves the rebased commits from branch to newBranch, pushes it and
+// opens a PR from it with the same details as old. Only once that works does
+// it comment on and close old and delete branch from the remote, so a failure
+// part way leaves the old PR untouched.
+func replacePR(dir, remote, branch, newBranch string, old *pullRequest) error {
+	fmt.Printf("renaming %s to %s\n", branch, newBranch)
+	if _, err := git(dir, "branch", "-m", branch, newBranch); err != nil {
+		return fmt.Errorf("renaming the branch failed: %v", err)
+	}
+	fmt.Printf("pushing %s\n", newBranch)
+	if err := gitInteractive(dir, "push", "-u", remote, newBranch); err != nil {
+		return fmt.Errorf("push failed: %v; the commits are on local branch %s", err, newBranch)
 	}
 
 	body := strings.TrimRight(old.Body, "\n")
@@ -388,7 +416,7 @@ func replacePR(dir, branch string, old *pullRequest) error {
 	}
 	body += fmt.Sprintf("Replaces #%d.", old.Number)
 
-	args := []string{"pr", "create", "--head", branch, "--base", old.BaseRefName,
+	args := []string{"pr", "create", "--head", newBranch, "--base", old.BaseRefName,
 		"--title", old.Title, "--body", body}
 	if old.IsDraft {
 		args = append(args, "--draft")
@@ -418,18 +446,82 @@ func replacePR(dir, branch string, old *pullRequest) error {
 	fmt.Println("opening new PR")
 	newURL, err := gh(dir, args...)
 	if err != nil {
-		if _, rerr := gh(dir, "pr", "reopen", num); rerr != nil {
-			return fmt.Errorf("creating the new PR failed (%v) and reopening #%d failed too (%v)", err, old.Number, rerr)
-		}
-		return fmt.Errorf("creating the new PR failed, so #%d was reopened: %v", old.Number, err)
+		return fmt.Errorf("creating the new PR failed, so #%d was left open: %v", old.Number, err)
 	}
 	newURL = lastLine(newURL)
 
-	if _, err := gh(dir, "pr", "comment", num, "--body", "Replaced by "+newURL); err != nil {
-		fmt.Fprintf(os.Stderr, "git-cheat-leadtime: warning: commenting on #%d failed: %v\n", old.Number, err)
+	num := fmt.Sprint(old.Number)
+	fmt.Printf("closing PR #%d\n", old.Number)
+	if _, err := gh(dir, "pr", "close", num, "--comment", "Replaced by "+newURL); err != nil {
+		return fmt.Errorf("opened %s but closing #%d failed: %v", newURL, old.Number, err)
+	}
+	if err := deleteRemoteBranch(dir, remote, branch, old); err != nil {
+		return fmt.Errorf("opened %s and closed #%d, but %v", newURL, old.Number, err)
 	}
 	fmt.Printf("replaced %s with %s\n", old.URL, newURL)
 	return nil
+}
+
+// deleteRemoteBranch deletes the old PR's branch and checks that it is gone.
+// GitHub only auto-deletes head branches on merge, never on close. If git push
+// --delete doesn't remove it (for example because the branch lives in a fork
+// rather than on remote), it falls back to the GitHub API on the PR's head repo.
+func deleteRemoteBranch(dir, remote, branch string, pr *pullRequest) error {
+	fmt.Printf("deleting %s/%s\n", remote, branch)
+	pushErr := gitInteractive(dir, "push", remote, "--delete", branch)
+	if !remoteBranchExists(dir, remote, branch) {
+		return nil
+	}
+
+	repo := pr.HeadRepositoryOwner.Login + "/" + pr.HeadRepository.Name
+	if repo == "/" {
+		return fmt.Errorf("branch %s is still on %s (git push --delete: %v); delete it with: git push %s --delete %s",
+			branch, remote, pushErr, remote, branch)
+	}
+	fmt.Printf("deleting %s from %s with the GitHub API\n", branch, repo)
+	ref := "repos/" + repo + "/git/refs/heads/" + branch
+	if _, err := gh(dir, "api", "-X", "DELETE", ref); err != nil {
+		// A 404/422 means the ref is already gone; confirm below.
+		if _, gerr := gh(dir, "api", ref); gerr == nil {
+			return fmt.Errorf("branch %s is still on %s: %v; delete it with: gh api -X DELETE %s", branch, repo, err, ref)
+		}
+	}
+	// Drop the stale remote-tracking ref, if any.
+	git(dir, "update-ref", "-d", "refs/remotes/"+remote+"/"+branch)
+	return nil
+}
+
+// remoteBranchExists asks the remote directly whether it has branch.
+// It assumes the branch still exists if the remote can't be reached.
+func remoteBranchExists(dir, remote, branch string) bool {
+	err := exec.Command("git", "-C", dir, "ls-remote", "--exit-code", "--heads", remote, "refs/heads/"+branch).Run()
+	if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 2 {
+		return false // no matching ref
+	}
+	return true
+}
+
+// newBranchName returns BRANCH-YYYYMMDD, adding -2, -3, ... if that is taken.
+// A date suffix from an earlier run is replaced rather than stacked.
+func newBranchName(dir, remote, branch string) string {
+	stem := dateSuffix.ReplaceAllString(branch, "")
+	date := time.Now().Format("20060102")
+	name := stem + "-" + date
+	for i := 2; name == branch || branchExists(dir, remote, name); i++ {
+		name = fmt.Sprintf("%s-%s-%d", stem, date, i)
+	}
+	return name
+}
+
+var dateSuffix = regexp.MustCompile(`-\d{8}(-\d+)?$`)
+
+// branchExists reports whether name exists locally or on the remote.
+func branchExists(dir, remote, name string) bool {
+	if _, err := git(dir, "rev-parse", "--verify", "-q", "refs/heads/"+name); err == nil {
+		return true
+	}
+	_, err := git(dir, "ls-remote", "--exit-code", "--heads", remote, "refs/heads/"+name)
+	return err == nil
 }
 
 // gh runs the gh CLI in dir. On failure the error includes gh's stderr.
