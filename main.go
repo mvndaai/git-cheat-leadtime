@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,11 +14,14 @@ import (
 	"strings"
 )
 
-const usage = `usage: git-cheat-leadtime [skip=fix] [base=BRANCH] [remote=NAME] [push] [DIR]
+const usage = `usage: git-cheat-leadtime [skip=fix] [base=BRANCH] [remote=NAME] [push] [newpr] [DIR]
   skip=fix  don't ask claude to resolve conflicts; stop the rebase for manual fixing
   base      branch to rebase onto (default: the remote's HEAD, else main or master)
   remote    remote to fetch from (default: origin)
   push      force push (with lease) when done
+  newpr     push, then close the branch's open PR and open a new one in its
+            place (same title, body, base, labels, assignees, reviewers) with
+            a comment on the old PR linking to the new one; needs gh
   DIR       repo to update (default: .)
 options may also be written -opt=VALUE or --opt=VALUE
 
@@ -31,6 +35,7 @@ type options struct {
 	base   string
 	remote string
 	push   bool
+	newpr  bool
 	dir    string
 }
 
@@ -78,9 +83,15 @@ func parseArgs(args []string) (*options, error) {
 			case "push":
 				opts.push = val != "false" && val != "0"
 				continue
+			case "newpr":
+				opts.newpr = val != "false" && val != "0"
+				continue
 			}
 		} else if key == "push" {
 			opts.push = true
+			continue
+		} else if key == "newpr" {
+			opts.newpr = true
 			continue
 		}
 		if strings.HasPrefix(arg, "-") {
@@ -98,6 +109,9 @@ func parseArgs(args []string) (*options, error) {
 		return nil, err
 	}
 	opts.dir = abs
+	if opts.newpr {
+		opts.push = true // the new PR needs the rewritten branch on the remote
+	}
 	return opts, nil
 }
 
@@ -115,6 +129,18 @@ func run(opts *options) error {
 	}
 	if st, _ := git(dir, "status", "--porcelain", "--untracked-files=no"); st != "" {
 		return fmt.Errorf("uncommitted changes; commit or stash them first")
+	}
+
+	// Look up the PR before rewriting anything, so a missing PR or gh
+	// problem fails fast instead of after the rebase.
+	var oldPR *pullRequest
+	if opts.newpr {
+		pr, err := findPR(dir, branch)
+		if err != nil {
+			return err
+		}
+		oldPR = pr
+		fmt.Printf("found PR #%d: %s\n", pr.Number, pr.Title)
 	}
 
 	base := opts.base
@@ -170,6 +196,11 @@ func run(opts *options) error {
 		fmt.Println("pushing")
 		if err := gitInteractive(dir, "push", "--force-with-lease", opts.remote, branch); err != nil {
 			return fmt.Errorf("push failed: %v", err)
+		}
+	}
+	if oldPR != nil {
+		if err := replacePR(dir, branch, oldPR); err != nil {
+			return err
 		}
 	}
 	fmt.Printf("done: %s is on %s with today's dates\n", branch, upstream)
@@ -289,4 +320,137 @@ func gitInteractive(dir string, args ...string) error {
 func exists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+type pullRequest struct {
+	Number      int    `json:"number"`
+	URL         string `json:"url"`
+	Title       string `json:"title"`
+	Body        string `json:"body"`
+	BaseRefName string `json:"baseRefName"`
+	IsDraft     bool   `json:"isDraft"`
+	Author      struct {
+		Login string `json:"login"`
+	} `json:"author"`
+	Labels []struct {
+		Name string `json:"name"`
+	} `json:"labels"`
+	Assignees []struct {
+		Login string `json:"login"`
+	} `json:"assignees"`
+	ReviewRequests []struct {
+		Login string `json:"login"` // empty for team requests
+	} `json:"reviewRequests"`
+	LatestReviews []struct {
+		Author struct {
+			Login string `json:"login"`
+		} `json:"author"`
+	} `json:"latestReviews"`
+}
+
+// findPR returns the open PR whose head is branch.
+func findPR(dir, branch string) (*pullRequest, error) {
+	if _, err := exec.LookPath("gh"); err != nil {
+		return nil, fmt.Errorf("newpr needs the gh CLI: https://cli.github.com")
+	}
+	out, err := gh(dir, "pr", "view", branch, "--json",
+		"number,url,title,body,baseRefName,isDraft,state,author,labels,assignees,reviewRequests,latestReviews")
+	if err != nil {
+		return nil, fmt.Errorf("no PR found for %s: %v", branch, err)
+	}
+	var pr struct {
+		pullRequest
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal([]byte(out), &pr); err != nil {
+		return nil, fmt.Errorf("can't read gh output: %v", err)
+	}
+	if pr.State != "OPEN" {
+		return nil, fmt.Errorf("PR #%d for %s is %s, not open", pr.Number, branch, strings.ToLower(pr.State))
+	}
+	return &pr.pullRequest, nil
+}
+
+// replacePR closes old and opens a new PR from branch with the same details,
+// then comments on old with a link to the new one. GitHub allows only one open
+// PR per branch and base, so old has to be closed first; if creating the new
+// one fails, old is reopened.
+func replacePR(dir, branch string, old *pullRequest) error {
+	num := fmt.Sprint(old.Number)
+	fmt.Printf("closing PR #%d\n", old.Number)
+	if _, err := gh(dir, "pr", "close", num); err != nil {
+		return fmt.Errorf("closing PR #%d failed: %v", old.Number, err)
+	}
+
+	body := strings.TrimRight(old.Body, "\n")
+	if body != "" {
+		body += "\n\n"
+	}
+	body += fmt.Sprintf("Replaces #%d.", old.Number)
+
+	args := []string{"pr", "create", "--head", branch, "--base", old.BaseRefName,
+		"--title", old.Title, "--body", body}
+	if old.IsDraft {
+		args = append(args, "--draft")
+	}
+	for _, l := range old.Labels {
+		args = append(args, "--label", l.Name)
+	}
+	for _, a := range old.Assignees {
+		args = append(args, "--assignee", a.Login)
+	}
+	// Re-request everyone who reviewed or was asked to; their reviews stay on
+	// the old PR.
+	seen := map[string]bool{old.Author.Login: true, "": true}
+	addReviewer := func(login string) {
+		if !seen[login] {
+			seen[login] = true
+			args = append(args, "--reviewer", login)
+		}
+	}
+	for _, r := range old.LatestReviews {
+		addReviewer(r.Author.Login)
+	}
+	for _, r := range old.ReviewRequests {
+		addReviewer(r.Login)
+	}
+
+	fmt.Println("opening new PR")
+	newURL, err := gh(dir, args...)
+	if err != nil {
+		if _, rerr := gh(dir, "pr", "reopen", num); rerr != nil {
+			return fmt.Errorf("creating the new PR failed (%v) and reopening #%d failed too (%v)", err, old.Number, rerr)
+		}
+		return fmt.Errorf("creating the new PR failed, so #%d was reopened: %v", old.Number, err)
+	}
+	newURL = lastLine(newURL)
+
+	if _, err := gh(dir, "pr", "comment", num, "--body", "Replaced by "+newURL); err != nil {
+		fmt.Fprintf(os.Stderr, "git-cheat-leadtime: warning: commenting on #%d failed: %v\n", old.Number, err)
+	}
+	fmt.Printf("replaced %s with %s\n", old.URL, newURL)
+	return nil
+}
+
+// gh runs the gh CLI in dir. On failure the error includes gh's stderr.
+func gh(dir string, args ...string) (string, error) {
+	c := exec.Command("gh", args...)
+	c.Dir = dir
+	var stderr bytes.Buffer
+	c.Stderr = &stderr
+	out, err := c.Output()
+	if err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return "", fmt.Errorf("%v: %s", err, msg)
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func lastLine(s string) string {
+	if i := strings.LastIndexByte(s, '\n'); i >= 0 {
+		return s[i+1:]
+	}
+	return s
 }
